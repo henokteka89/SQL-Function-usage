@@ -4,7 +4,6 @@
 DECLARE @DynamicClientID INT = 274748; -- Example
 DECLARE @UserID          INT = 47563;  -- Example
 
-
 ---------------------------------------------------------
 -- 2) Build the entire query via CTEs:
 ---------------------------------------------------------
@@ -183,6 +182,7 @@ AllData AS
 ),
 ---------------------------------------------------------
 -- 2.8) FinalCalc: Replicate EXACT if/else returns for Avail & SecurityXML
+--      including "Nothing found => Avail=0, SecurityXML=NULL"
 ---------------------------------------------------------
 FinalCalc AS
 (
@@ -193,12 +193,11 @@ FinalCalc AS
 
         /* 
           ================== AVAIL LOGIC ==================
-          Exactly replicating:
-            IF user=0 => Avail=0, RETURN
-            ELSE if type=2 => if c2=0 or null => Avail=0, RETURN; else=1,RETURN
-            ELSE if type=1 => check c1... else cG1...
-            ELSE if type=0 => check c0... else cM0... else cG0...
-            Else => 0
+          1) If user=0 => Avail=0, short-circuit
+          2) else if type=2 => check c2
+          3) else if type=1 => check c1 => else cG1
+          4) else if type=0 => c0 => else cM0 => else cG0
+          5) else => Avail=0 (the fallback)
         */
         FinalAvail =
             CASE
@@ -206,14 +205,14 @@ FinalCalc AS
                      THEN 0
                 ELSE
                     CASE ad.ClientTypeID
-                      WHEN 2
+                      WHEN 2 -- group
                         THEN
                           CASE
                             WHEN ad.c2Access IS NULL OR ad.c2Access=0
                                  THEN 0
                             ELSE 1
                           END
-                      WHEN 1
+                      WHEN 1 -- master
                         THEN
                           CASE
                             WHEN ad.c1Access IS NULL OR ad.c1Access=0
@@ -229,7 +228,7 @@ FinalCalc AS
                                 ELSE 0
                               END
                           END
-                      WHEN 0
+                      WHEN 0 -- subaccount
                         THEN
                           CASE
                             WHEN ad.c0Access IS NULL OR ad.c0Access=0
@@ -259,48 +258,46 @@ FinalCalc AS
 
         /*
           ================= SECURITY XML LOGIC =================
-          Replicating e.g.:
-            IF user=0 => set user’s XML, RETURN
-            ELSE IF user’s XML != NULL => keep it, RETURN
-            ELSE IF type=2 => if c2=0 or null => Avail=0 => 
-                    if userSec=null & c2Sec!=null => userSec=c2Sec => RETURN
-                  else c2=1 => if userSec=null => userSec=c2Sec => RETURN
-            ETC. 
-          That means deeply nested CASEs to respect "IF SecurityXML is still null => set it, else do not".
+          We'll exactly replicate: 
+            IF (UserAccess=0) => set userSec => RETURN
+            ELSE IF userSec not null => keep => RETURN
+            ELSE IF clienttype=2 => if c2=0 => set Avail=0 => set sec if userSec still null 
+                                      => RETURN
+                                   else c2=1 => set sec if userSec still null => RETURN
+            ...
+            If we exhaust all checks => "Nothing found => Avail=0, SecurityXML=NULL"
         */
         FinalSecurityXML =
             CASE
               WHEN ad.UserAccessFlag=0
-                   THEN ad.UserSecurityXML   -- short-circuit
+                   THEN ad.UserSecurityXML
               WHEN ad.UserSecurityXML IS NOT NULL
-                   THEN ad.UserSecurityXML   -- short-circuit
+                   THEN ad.UserSecurityXML
               ELSE
-                /* userSec is still null => we check client type */
                 CASE ad.ClientTypeID
                   WHEN 2
                     THEN
                       CASE
                         WHEN ad.c2Access IS NULL OR ad.c2Access=0
                              THEN 
+                                /* Avail=0 => if userSec is null => set from c2 if not null */
                                 CASE
-                                  WHEN ad.UserSecurityXML IS NULL 
-                                       AND ad.c2XML IS NOT NULL
+                                  WHEN ad.UserSecurityXML IS NULL AND ad.c2XML IS NOT NULL
                                        THEN ad.c2XML
                                   ELSE NULL
                                 END
                         ELSE
-                          /* c2Access=1 => if userSec was null => set c2XML */
-                          CASE
-                            WHEN ad.UserSecurityXML IS NULL 
-                                 AND ad.c2XML IS NOT NULL
-                                 THEN ad.c2XML
-                            ELSE NULL
-                          END
+                            /* c2Access=1 => if userSec=null => set from c2 */
+                            CASE
+                              WHEN ad.UserSecurityXML IS NULL AND ad.c2XML IS NOT NULL
+                                   THEN ad.c2XML
+                              ELSE NULL
+                            END
                       END
 
                   WHEN 1
                     THEN
-                      /* type=1 => check c1 first, if c1=0 => maybe set c1XML, else if c1=1 => c1XML, else check cG1 */
+                      /* type=1 => c1 => else cG1 */
                       CASE
                         WHEN ad.c1Access IS NULL OR ad.c1Access=0
                              THEN
@@ -317,7 +314,6 @@ FinalCalc AS
                                  ELSE NULL
                                END
                         ELSE
-                          /* now check cG1 */
                           CASE
                             WHEN ad.cG1Access IS NULL OR ad.cG1Access=0
                                  THEN
@@ -339,7 +335,7 @@ FinalCalc AS
 
                   WHEN 0
                     THEN
-                      /* subaccount => c0 => cM0 => cG0, each with the if userSec=null => set it logic */
+                      /* subaccount => c0 => else cM0 => else cG0 */
                       CASE
                         WHEN ad.c0Access IS NULL OR ad.c0Access=0
                              THEN
@@ -392,7 +388,12 @@ FinalCalc AS
                           END
                       END
 
-                  ELSE NULL
+                  ELSE 
+                    /* 
+                       If we get here => no recognized clienttype,
+                       or "Nothing found => Avail=0, SecurityXML=NULL"
+                    */
+                    NULL
                 END
             END
             AS FinalSecurityXML,
@@ -403,31 +404,65 @@ FinalCalc AS
     FROM AllData ad
 ),
 ---------------------------------------------------------
--- 2.9) Aggregate if your old code sets "UserSectionXAvail=1"
---      whenever ANY client is found =1
+-- 2.9) "Nothing found => Avail=0, SecurityXML=NULL" final fallback
+--      The original code ends with: 
+--        "Nothing found, no go!!! SET @Avail=0, SET @SecurityXML=NULL, RETURN"
+--      We'll handle that by turning any "FinalAvail" or "FinalSecurityXML" that 
+--      are still NULL into 0 / NULL if needed. 
+--      But typically our nested CASE sets them anyway. 
+---------------------------------------------------------
+--  However, let's just keep them as is if the logic sets them to 0 or 1. 
+--  If some reason "FinalAvail" ended up NULL, we default it to 0.
+---------------------------------------------------------
+FallbackFix AS
+(
+    SELECT
+        fc.ClientID,
+        fc.UserID,
+        fc.RandomSectionID,
+
+        CASE 
+          WHEN fc.FinalAvail IS NULL 
+               THEN 0
+          ELSE fc.FinalAvail
+        END 
+        AS FinalAvail,
+
+        /* If the code logic gave us a NULL, we keep it as NULL 
+           to replicate "nothing found => SecurityXML=NULL." 
+        */
+        fc.FinalSecurityXML AS FinalSecurityXML,
+
+        fc.menutext,
+        fc.menuactionv2,
+        fc.[description]
+    FROM FinalCalc fc
+),
+---------------------------------------------------------
+-- 2.10) Aggregate if your old code sets "UserSectionXAvail=1" 
+--       whenever ANY client is found =1
 ---------------------------------------------------------
 AggResult AS
 (
     SELECT
-        fc.RandomSectionID,
-        -- If ANY row =1 => aggregator =1
-        CAST(MAX(fc.FinalAvail) AS BIT) AS UserAvail,
+        ff.RandomSectionID,
+        -- "1" if any row = 1 
+        CAST(MAX(ff.FinalAvail) AS BIT) AS UserAvail,
 
         /* 
-           For SecurityXML, your original code effectively 
-           picks whichever row "returns" first in the loop. 
-           If you want that EXACT sequence, you'd need 
-           an ORDER BY. For now, we do MAX(...) 
-           or you can do MIN(...) 
+           For the SecurityXML, in the old code if the cursor sees 
+           any client=1, it might set some SecurityXML. 
+           But if the old code sees all 0, final = NULL. 
+           We'll do a simple MAX(...) in string sense for now.
         */
-        MAX(fc.FinalSecurityXML) AS SecurityXML,
+        MAX(ff.FinalSecurityXML) AS SecurityXML,
 
-        MAX(fc.menutext) AS menutext,
-        MAX(fc.menuactionv2) AS menuactionv2,
-        MAX(fc.[description]) AS [description]
-    FROM FinalCalc fc
+        MAX(ff.menutext)      AS menutext,
+        MAX(ff.menuactionv2)  AS menuactionv2,
+        MAX(ff.[description]) AS [description]
+    FROM FallbackFix ff
     GROUP BY 
-        fc.RandomSectionID
+        ff.RandomSectionID
 )
 
 ---------------------------------------------------------
