@@ -1,0 +1,335 @@
+---------------------------------------------------------
+-- 1) Declare parameters for testing (like your old proc):
+---------------------------------------------------------
+DECLARE @DynamicClientID INT = 274748; -- Example
+DECLARE @UserID          INT = 47563;  -- Example
+
+---------------------------------------------------------
+-- 2) Use a CTE chain to do everything in one shot:
+---------------------------------------------------------
+;WITH 
+---------------------------------------------------------
+-- 2.1) Gather all clientids from the dynamic client
+---------------------------------------------------------
+DynamicClients AS
+(
+    SELECT ClientID
+    FROM fn_DCG_GetClientIDsForDynamicClientID(@DynamicClientID)
+),
+---------------------------------------------------------
+-- 2.2) The random sections you care about (1..10)
+---------------------------------------------------------
+Sections AS
+(
+    SELECT 
+        randomsectionid,
+        menutext,
+        menuactionv2,
+        [description]
+    FROM randomsection WITH (NOLOCK)
+    WHERE randomsectionid BETWEEN 1 AND 10
+),
+---------------------------------------------------------
+-- 2.3) Cross-join clientids to randomsectionids
+---------------------------------------------------------
+InputGrid AS
+(
+    SELECT
+        dc.ClientID,
+        s.randomsectionid,
+        s.menutext,
+        s.menuactionv2,
+        s.[description]
+    FROM DynamicClients dc
+    CROSS JOIN Sections s
+),
+---------------------------------------------------------
+-- 2.4) Bring in user-level data (myescreenrandomusersectionsettings)
+--      which does NOT have clientid. We only match on (UserID,randomsectionid).
+---------------------------------------------------------
+UserData AS
+(
+    SELECT
+        ig.ClientID,
+        @UserID AS UserID,
+        ig.randomsectionid,
+        ig.menutext,
+        ig.menuactionv2,
+        ig.[description],
+
+        us.accessflag  AS UserAccessFlag,
+        us.SecurityXML AS UserSecurityXML
+    FROM
+        InputGrid ig
+        LEFT JOIN myescreenrandomusersectionsettings us
+               ON us.UserID          = @UserID
+              AND us.randomsectionid = ig.randomsectionid
+),
+---------------------------------------------------------
+-- 2.5) Determine each ClientID's type (0,1,2), plus MasterID, GroupID
+---------------------------------------------------------
+ClientType AS
+(
+    SELECT
+        ca.clientid,
+        ca.clientaccount,
+        ca.clientsubaccount,
+        ne.groupid,
+        m.clientid AS MasterID,
+        CASE 
+          WHEN ca.clientsubaccount <> 0 THEN 0  -- subaccount
+          WHEN ne.groupid = ca.clientid THEN 2  -- group
+          ELSE 1                                -- master
+        END AS ClientTypeID
+    FROM clientaccounts ca
+    LEFT JOIN nationalaccountextras ne 
+           ON ne.clientid = ca.clientid
+    LEFT JOIN clientaccounts m
+           ON m.clientaccount    = ca.clientaccount
+          AND m.clientsubaccount = 0
+),
+---------------------------------------------------------
+-- 2.6) Reference the client-level table (myescreenrandomclientsectionsettings)
+---------------------------------------------------------
+ClientRandom AS
+(
+    SELECT
+        crs.clientid,
+        crs.clienttypeid,
+        crs.randomsectionid,
+        crs.accessflag,
+        crs.securityxml
+    FROM myescreenrandomclientsectionsettings crs WITH (NOLOCK)
+),
+---------------------------------------------------------
+-- 2.7) Combine everything into one row (AllData)
+--      so we can replicate multi-layer "if" logic
+---------------------------------------------------------
+AllData AS
+(
+    SELECT
+        ud.ClientID,
+        ud.UserID,
+        ud.RandomSectionID,
+        ud.UserAccessFlag,
+        ud.UserSecurityXML,
+
+        ct.ClientTypeID,
+        ct.MasterID,
+        ct.groupid,
+
+        ud.menutext,
+        ud.menuactionv2,
+        ud.[description],
+
+        -- type=2 row
+        c2.accessflag  AS c2Access,
+        c2.securityxml AS c2XML,
+
+        -- type=1 row (master + group)
+        c1.accessflag   AS c1Access,
+        c1.securityxml  AS c1XML,
+        cG1.accessflag  AS cG1Access,
+        cG1.securityxml AS cG1XML,
+
+        -- type=0 row (subaccount + master + group)
+        c0.accessflag   AS c0Access,
+        c0.securityxml  AS c0XML,
+        cM0.accessflag  AS cM0Access,
+        cM0.securityxml AS cM0XML,
+        cG0.accessflag  AS cG0Access,
+        cG0.securityxml AS cG0XML
+    FROM UserData ud
+    INNER JOIN ClientType ct
+        ON ct.clientid = ud.ClientID
+
+    -- For type=2 (group):
+    LEFT JOIN ClientRandom c2
+           ON c2.clientid       = ud.ClientID
+          AND c2.clienttypeid   = 2
+          AND c2.randomsectionid= ud.RandomSectionID
+
+    -- For type=1 (master):
+    LEFT JOIN ClientRandom c1
+           ON c1.clientid       = ud.ClientID
+          AND c1.clienttypeid   = 1
+          AND c1.randomsectionid= ud.RandomSectionID
+
+    LEFT JOIN ClientRandom cG1
+           ON cG1.clientid       = ct.groupid
+          AND cG1.clienttypeid   = 1
+          AND cG1.randomsectionid= ud.RandomSectionID
+
+    -- For type=0 (subaccount):
+    LEFT JOIN ClientRandom c0
+           ON c0.clientid        = ud.ClientID
+          AND c0.clienttypeid    = 0
+          AND c0.randomsectionid = ud.RandomSectionID
+
+    LEFT JOIN ClientRandom cM0
+           ON cM0.clientid        = ct.MasterID
+          AND cM0.clienttypeid    = 0
+          AND cM0.randomsectionid = ud.RandomSectionID
+
+    LEFT JOIN ClientRandom cG0
+           ON cG0.clientid        = ct.groupid
+          AND cG0.clienttypeid    = 0
+          AND cG0.randomsectionid = ud.RandomSectionID
+),
+---------------------------------------------------------
+-- 2.8) FinalCalc: Replicate the stored-proc logic in nested CASE
+---------------------------------------------------------
+FinalCalc AS
+(
+    SELECT
+        ad.ClientID,
+        ad.UserID,
+        ad.RandomSectionID,
+
+        ------------------------------------------------
+        -- FinalAvail logic
+        ------------------------------------------------
+        FinalAvail =
+            CASE 
+                -- If user is 0 => short-circuit to 0
+                WHEN ad.UserAccessFlag = 0 
+                     THEN 0
+                ELSE
+                    CASE ad.ClientTypeID
+                        WHEN 2 THEN
+                            /* group type=2 => check c2.accessflag */
+                            CASE
+                              WHEN ad.c2Access IS NULL OR ad.c2Access=0 THEN 0
+                              ELSE 1
+                            END
+                        WHEN 1 THEN
+                            /* master type=1 => check c1, then group(1) */
+                            CASE
+                              WHEN ad.c1Access=0 
+                                   THEN 0
+                              WHEN ad.c1Access=1 AND ad.UserAccessFlag=1
+                                   THEN 1
+                              ELSE
+                                CASE
+                                  WHEN ad.cG1Access=0 
+                                       THEN 0
+                                  WHEN ad.cG1Access=1 AND ad.UserAccessFlag=1
+                                       THEN 1
+                                  ELSE 0
+                                END
+                            END
+                        WHEN 0 THEN
+                            /* subaccount => c0 => cM0 => cG0 chain */
+                            CASE
+                              WHEN ad.c0Access=0 
+                                   THEN 0
+                              WHEN ad.c0Access=1 AND ad.UserAccessFlag=1
+                                   THEN 1
+                              ELSE
+                                CASE
+                                  WHEN ad.cM0Access=0 
+                                       THEN 0
+                                  WHEN ad.cM0Access=1 AND ad.UserAccessFlag=1
+                                       THEN 1
+                                  ELSE
+                                    CASE
+                                      WHEN ad.cG0Access=0
+                                           THEN 0
+                                      WHEN ad.cG0Access=1 AND ad.UserAccessFlag=1
+                                           THEN 1
+                                      ELSE 0
+                                    END
+                                END
+                            END
+                        ELSE 0
+                    END
+            END,
+
+        ------------------------------------------------
+        -- FinalSecurityXML logic
+        ------------------------------------------------
+        FinalSecurityXML =
+            CASE
+                -- If user=0 => use user's XML
+                WHEN ad.UserAccessFlag=0 
+                     THEN ad.UserSecurityXML
+
+                -- If user has its own XML => use that
+                WHEN ad.UserSecurityXML IS NOT NULL
+                     THEN ad.UserSecurityXML
+
+                ELSE
+                    -- else pick from the relevant client row
+                    CASE ad.ClientTypeID
+                        WHEN 2 THEN
+                            /* group => c2 XML */
+                            ad.c2XML
+                        WHEN 1 THEN
+                            /* master => check c1 or cG1 */
+                            CASE
+                              WHEN ad.c1Access=0 
+                                   THEN ad.c1XML
+                              WHEN ad.c1Access=1 AND ad.UserAccessFlag=1
+                                   THEN ad.c1XML
+                              ELSE ad.cG1XML
+                            END
+                        WHEN 0 THEN
+                            /* subaccount => c0 => cM0 => cG0 */
+                            CASE
+                              WHEN ad.c0Access=0 
+                                   THEN ad.c0XML
+                              WHEN ad.c0Access=1 AND ad.UserAccessFlag=1
+                                   THEN ad.c0XML
+                              ELSE
+                                CASE
+                                  WHEN ad.cM0Access=0 
+                                       THEN ad.cM0XML
+                                  WHEN ad.cM0Access=1 AND ad.UserAccessFlag=1
+                                       THEN ad.cM0XML
+                                  ELSE ad.cG0XML
+                                END
+                            END
+                        ELSE NULL
+                    END
+            END,
+
+        ad.menutext,
+        ad.menuactionv2,
+        ad.[description]
+    FROM AllData ad
+),
+---------------------------------------------------------
+-- 2.9) Aggregate if the old code wants a single row
+--      per RandomSectionID, set to 1 if ANY client=1
+---------------------------------------------------------
+AggResult AS
+(
+    SELECT
+        fc.RandomSectionID,
+        -- "1" if any row yields Avail=1
+        CAST(MAX(fc.FinalAvail) AS BIT) AS UserAvail,
+
+        -- For the SecurityXML, we pick the "max" in string sense
+        -- or whichever approach you want to mimic your logic:
+        MAX(fc.FinalSecurityXML) AS SecurityXML,
+
+        MAX(fc.menutext) AS menutext,
+        MAX(fc.menuactionv2) AS menuactionv2,
+        MAX(fc.[description]) AS [description]
+    FROM FinalCalc fc
+    GROUP BY 
+        fc.RandomSectionID
+)
+
+---------------------------------------------------------
+-- 3) Return the final rows like the old proc does
+---------------------------------------------------------
+SELECT
+    a.UserAvail,
+    a.SecurityXML,
+    a.menutext,
+    a.menuactionv2,
+    a.RandomSectionID,
+    a.[description]
+FROM AggResult a
+ORDER BY a.RandomSectionID;
