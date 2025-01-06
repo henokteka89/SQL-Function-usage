@@ -1,0 +1,346 @@
+CREATE OR ALTER PROCEDURE [dbo].[usp_MyEUsers_Get_RandomsSubMenu_Blend]
+(
+    @ClientID        INT,
+    @DynamicClientID INT,
+    @UserID          INT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    ----------------------------------------------------------------------------
+    -- 1) Gather the relevant clientIDs (subaccounts, etc.) from 
+    --    fn_DCG_GetClientIDsForDynamicClientID if @DynamicClientID is provided.
+    ----------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#clientIDs') IS NOT NULL
+        DROP TABLE #clientIDs;
+
+    IF @DynamicClientID IS NOT NULL
+    BEGIN
+        SELECT ClientID
+        INTO #clientIDs
+        FROM fn_DCG_GetClientIDsForDynamicClientID(@DynamicClientID);
+    END
+    ELSE
+    BEGIN
+        SELECT @ClientID AS ClientID
+        INTO #clientIDs;
+    END
+
+    ----------------------------------------------------------------------------
+    -- 2) Basic list of RandomSection rows (IDs 1..10).
+    ----------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#RandomSections') IS NOT NULL
+        DROP TABLE #RandomSections;
+
+    CREATE TABLE #RandomSections
+    (
+        RandomSectionID INT PRIMARY KEY,
+        MenuText        VARCHAR(100),
+        MenuActionV2    VARCHAR(200),
+        Description     VARCHAR(100)
+    );
+
+    INSERT INTO #RandomSections (RandomSectionID, MenuText, MenuActionV2, Description)
+    SELECT RandomSectionID, MenuText, MenuActionV2, Description
+    FROM randomsection (NOLOCK)
+    WHERE RandomSectionID BETWEEN 1 AND 10;
+
+    ----------------------------------------------------------------------------
+    -- 3) Determine user availability in set-based form, plus user SecurityXML.
+    ----------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#UserAvailability') IS NOT NULL
+        DROP TABLE #UserAvailability;
+
+    CREATE TABLE #UserAvailability
+    (
+        RandomSectionID INT PRIMARY KEY,
+        UserAvail       INT,           -- 0 or 1
+        SecurityXML     VARCHAR(1000)  -- from user settings
+    );
+
+    INSERT INTO #UserAvailability(RandomSectionID, UserAvail)
+    SELECT 
+        rs.RandomSectionID,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 
+                FROM myescreenrandomusersectionsettings uss (NOLOCK)
+                WHERE uss.UserID          = @UserID
+                  AND uss.RandomSectionID = rs.RandomSectionID
+                  AND uss.AccessFlag      = 0
+            )
+                THEN 0
+            WHEN EXISTS (
+                SELECT 1 
+                FROM myescreenrandomusersectionsettings uss (NOLOCK)
+                WHERE uss.UserID          = @UserID
+                  AND uss.RandomSectionID = rs.RandomSectionID
+                  AND uss.AccessFlag      = 1
+            )
+                THEN 1
+            ELSE 0  -- If no row found at all, treat as 0 or 1 depending on old defaults
+        END AS UserAvail
+    FROM #RandomSections rs;
+
+    -- Fill the user's SecurityXML if present:
+    UPDATE ua
+       SET ua.SecurityXML = uss.SecurityXML
+    FROM #UserAvailability ua
+    JOIN myescreenrandomusersectionsettings uss (NOLOCK)
+       ON uss.UserID          = @UserID
+      AND uss.RandomSectionID = ua.RandomSectionID
+    WHERE uss.AccessFlag = ua.UserAvail;
+
+    ----------------------------------------------------------------------------
+    -- 4) For each client in #clientIDs, determine if it's subaccount (0), master (1), or group (2).
+    --    Also fetch the MasterID / GroupID so we can do the fallback checks.
+    ----------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#FilteredClients') IS NOT NULL
+        DROP TABLE #FilteredClients;
+
+    CREATE TABLE #FilteredClients
+    (
+        ClientID        INT,
+        ClientTypeID    INT,  -- 0 = subaccount, 1 = master, 2 = group
+        ClientSubaccount INT,
+        MasterID        INT,
+        GroupID         INT
+    );
+
+    INSERT INTO #FilteredClients (ClientID, ClientTypeID, ClientSubaccount, MasterID, GroupID)
+    SELECT DISTINCT
+        ca.ClientID,
+        CASE 
+           WHEN ca.ClientSubaccount <> 0 THEN 0
+           WHEN EXISTS (
+               SELECT 1
+               FROM NationalAccountExtras nae (NOLOCK)
+               WHERE nae.GroupID = ca.ClientID
+           )
+               THEN 2
+           ELSE 1
+        END AS ClientTypeID,
+        ca.ClientSubaccount,
+        (SELECT TOP 1 c2.ClientID
+         FROM clientaccounts c2 (NOLOCK)
+         WHERE c2.ClientAccount    = ca.ClientAccount
+           AND c2.ClientSubaccount = 0
+        ) AS MasterID,
+        (SELECT TOP 1 nae2.GroupID
+         FROM nationalaccountextras nae2 (NOLOCK)
+         WHERE nae2.ClientID = ca.ClientID
+        ) AS GroupID
+    FROM #clientIDs c
+    JOIN dbo.clientaccounts ca (NOLOCK) 
+        ON ca.ClientID = c.ClientID;
+
+    ----------------------------------------------------------------------------
+    -- 5) We now do a single pass that left-joins up to three
+    --    myescreenrandomclientsectionsettings rows: subaccount, master, group.
+    --    Then we replicate the "if subaccount=0 => immediate deny" logic via CASE.
+    ----------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#ClientAvailabilityDetail') IS NOT NULL
+        DROP TABLE #ClientAvailabilityDetail;
+
+    CREATE TABLE #ClientAvailabilityDetail
+    (
+        ClientID         INT,
+        RandomSectionID  INT,
+        FinalAvail       INT,          -- 0 or 1
+        FinalSecurityXML VARCHAR(1000) -- from whichever fallback was used
+    );
+
+    -- We'll cross join each client + each random section, then left join up to 3 rows 
+    -- from myescreenrandomclientsectionsettings: scs (subaccount?), mcs (master?), gcs (group?).
+    WITH Joined AS
+    (
+        SELECT
+            fc.ClientID,
+            rs.RandomSectionID,
+
+            -- For the subaccount row (only relevant if fc.ClientTypeID=0):
+            scs.AccessFlag   AS SubAccFlag,
+            scs.SecurityXML  AS SubAccXML,
+
+            -- For the master row:
+            mcs.AccessFlag   AS MasterFlag,
+            mcs.SecurityXML  AS MasterXML,
+
+            -- For the group row:
+            gcs.AccessFlag   AS GroupFlag,
+            gcs.SecurityXML  AS GroupXML,
+
+            fc.ClientTypeID
+        FROM #FilteredClients fc
+        CROSS JOIN #RandomSections rs
+        -- Subaccount row (clienttypeid=0 in old table):
+        LEFT JOIN myescreenrandomclientsectionsettings scs (NOLOCK)
+               ON scs.ClientID        = fc.ClientID
+              AND scs.ClientTypeID    = fc.ClientTypeID  -- if 0, subaccount row
+              AND scs.RandomSectionID = rs.RandomSectionID
+
+        -- Master row:
+        LEFT JOIN myescreenrandomclientsectionsettings mcs (NOLOCK)
+               ON mcs.ClientID        = fc.MasterID 
+              AND mcs.ClientTypeID    = 1
+              AND mcs.RandomSectionID = rs.RandomSectionID
+
+        -- Group row:
+        LEFT JOIN myescreenrandomclientsectionsettings gcs (NOLOCK)
+               ON gcs.ClientID        = fc.GroupID
+              AND gcs.ClientTypeID    = 2
+              AND gcs.RandomSectionID = rs.RandomSectionID
+    )
+    INSERT INTO #ClientAvailabilityDetail (ClientID, RandomSectionID, FinalAvail, FinalSecurityXML)
+    SELECT
+        J.ClientID,
+        J.RandomSectionID,
+
+        CASE 
+          WHEN J.ClientTypeID = 0  -- subaccount logic
+            THEN CASE 
+              WHEN J.SubAccFlag = 0 THEN 0
+              WHEN J.SubAccFlag = 1 THEN 1
+              WHEN J.SubAccFlag IS NULL 
+                THEN CASE 
+                  WHEN J.MasterFlag = 0 THEN 0
+                  WHEN J.MasterFlag = 1 THEN 1
+                  WHEN J.MasterFlag IS NULL 
+                    THEN CASE
+                      WHEN J.GroupFlag = 0 THEN 0
+                      WHEN J.GroupFlag = 1 THEN 1
+                      ELSE 0  -- no row => 0
+                    END
+                END
+            END
+
+          WHEN J.ClientTypeID = 1  -- master logic
+            THEN CASE
+              WHEN J.MasterFlag = 0 THEN 0
+              WHEN J.MasterFlag = 1 THEN 1
+              WHEN J.MasterFlag IS NULL
+                THEN CASE
+                  WHEN J.GroupFlag = 0 THEN 0
+                  WHEN J.GroupFlag = 1 THEN 1
+                  ELSE 0
+                END
+            END
+
+          WHEN J.ClientTypeID = 2  -- group logic
+            THEN CASE
+              WHEN J.GroupFlag = 0 THEN 0
+              WHEN J.GroupFlag = 1 THEN 1
+              ELSE 0
+            END
+
+          ELSE 0
+        END AS FinalAvail,
+
+        CASE 
+          WHEN J.ClientTypeID = 0  -- subaccount fallback
+            THEN CASE 
+              WHEN J.SubAccFlag IN (0,1)
+                THEN J.SubAccXML
+              WHEN J.SubAccFlag IS NULL 
+                THEN CASE 
+                  WHEN J.MasterFlag IN (0,1) THEN J.MasterXML
+                  WHEN J.MasterFlag IS NULL
+                    THEN CASE
+                      WHEN J.GroupFlag IN (0,1) THEN J.GroupXML
+                      ELSE NULL
+                    END
+                END
+            END
+
+          WHEN J.ClientTypeID = 1  -- master fallback
+            THEN CASE
+              WHEN J.MasterFlag IN (0,1) 
+                THEN J.MasterXML
+              WHEN J.MasterFlag IS NULL
+                THEN CASE
+                  WHEN J.GroupFlag IN (0,1) THEN J.GroupXML
+                  ELSE NULL
+                END
+            END
+
+          WHEN J.ClientTypeID = 2  -- group fallback
+            THEN CASE
+              WHEN J.GroupFlag IN (0,1) THEN J.GroupXML
+              ELSE NULL
+            END
+
+          ELSE NULL
+        END AS FinalSecurityXML
+    FROM Joined J;
+
+    ----------------------------------------------------------------------------
+    -- 6) If we have multiple clientIDs from @DynamicClientID, we do the same logic 
+    --    as the old code's cursor: if *any* client row is 1 => final is 1, else 0.
+    --    Similarly, pick the first "grant" XML encountered or the "deny" if all 0?
+    --
+    --    We'll do a simple "priority" approach, or you can do a MIN/MAX approach.
+    ----------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#ClientAvailabilityGrouped') IS NOT NULL
+        DROP TABLE #ClientAvailabilityGrouped;
+
+    CREATE TABLE #ClientAvailabilityGrouped
+    (
+        RandomSectionID INT PRIMARY KEY,
+        ClientAvail     INT,          -- final across all clients
+        SecurityXML     VARCHAR(1000) -- whichever row was "winning"
+    );
+
+    ;WITH cte AS
+    (
+        SELECT
+            cad.RandomSectionID,
+            CASE WHEN cad.FinalAvail=1 THEN 2 ELSE 1 END AS Priority, 
+            cad.FinalAvail,
+            cad.FinalSecurityXML,
+            ROW_NUMBER() OVER (
+               PARTITION BY cad.RandomSectionID
+               ORDER BY 
+                 CASE WHEN cad.FinalAvail=1 THEN 2 ELSE 1 END DESC,
+                 (CASE WHEN cad.FinalSecurityXML IS NOT NULL THEN 1 ELSE 0 END) DESC
+            ) AS rn
+        FROM #ClientAvailabilityDetail cad
+    )
+    INSERT INTO #ClientAvailabilityGrouped (RandomSectionID, ClientAvail, SecurityXML)
+    SELECT
+       RandomSectionID,
+       FinalAvail,
+       FinalSecurityXML
+    FROM cte
+    WHERE rn=1;
+
+    ----------------------------------------------------------------------------
+    -- 7) Final SELECT combining user + client + security logic:
+    ----------------------------------------------------------------------------
+    SELECT 
+       CAST(cg.ClientAvail AS BIT) AS ClientAvail,
+       CASE 
+          WHEN ua.UserAvail = 0 THEN 0
+          WHEN cg.ClientAvail = 0 THEN 0
+          ELSE 1
+       END AS UserAvail,
+       CASE 
+          WHEN ua.UserAvail = 0 THEN ua.SecurityXML
+          WHEN ua.SecurityXML IS NOT NULL THEN ua.SecurityXML
+          WHEN cg.SecurityXML IS NOT NULL THEN cg.SecurityXML
+          ELSE NULL
+       END AS SecurityXML,
+       rs.MenuText,
+       rs.MenuActionV2,
+       rs.RandomSectionID,
+       rs.Description
+    FROM #RandomSections rs
+    JOIN #ClientAvailabilityGrouped cg
+      ON cg.RandomSectionID = rs.RandomSectionID
+    JOIN #UserAvailability ua
+      ON ua.RandomSectionID = rs.RandomSectionID
+    ORDER BY rs.RandomSectionID;
+
+    SET NOCOUNT OFF;
+END;
+GO
